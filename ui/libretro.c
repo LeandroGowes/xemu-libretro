@@ -153,6 +153,7 @@ static bool opt_skip_boot_anim = false;
 static bool opt_hard_fpu = true;
 static bool opt_use_dsp = false;
 static int  opt_surface_scale = 1;
+static int  opt_renderer = 0; /* 0=frontend preference, 1=OpenGL, 2=Vulkan */
 static int  opt_avpack = CONFIG_SYS_AVPACK_HDTV;
 static bool opt_cache_shaders = true;
 static int  opt_filtering = CONFIG_DISPLAY_FILTERING_LINEAR;
@@ -684,6 +685,13 @@ static void update_variables(void)
         opt_hard_fpu = !strcmp(var.value, "enabled");
     }
 
+    var.key = "xemu_renderer";
+    var.value = NULL;
+    if (environ_cb && environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+        opt_renderer = !strcmp(var.value, "vulkan") ? 2 :
+                       !strcmp(var.value, "opengl") ? 1 : 0;
+    }
+
     var.key = "xemu_surface_scale";
     var.value = NULL;
     if (environ_cb && environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
@@ -991,10 +999,10 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
 {
     memset(info, 0, sizeof(*info));
-    info->geometry.base_width   = 640;
-    info->geometry.base_height  = 480;
-    info->geometry.max_width    = 1920;
-    info->geometry.max_height   = 1080;
+    info->geometry.base_width   = 640 * opt_surface_scale;
+    info->geometry.base_height  = 480 * opt_surface_scale;
+    info->geometry.max_width    = 6400;
+    info->geometry.max_height   = 5760;
     info->geometry.aspect_ratio = 4.0f / 3.0f;
     info->timing.fps            = 59.94;
     info->timing.sample_rate    = 48000.0;
@@ -1137,7 +1145,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
     }
     LRLOG_INFO("[xemu] Frontend preferred HW render: %u\n", preferred_hw);
 
-    bool want_vulkan = (preferred_hw == RETRO_HW_CONTEXT_VULKAN);
+    bool want_vulkan = opt_renderer == 2 ||
+                       (opt_renderer == 0 && preferred_hw == RETRO_HW_CONTEXT_VULKAN);
 
     /* Setup hardware rendering based on frontend preference */
     memset(&hw_render, 0, sizeof(hw_render));
@@ -1293,10 +1302,27 @@ RETRO_API void retro_run(void)
         GLuint tex = nv2a_get_framebuffer_surface();
         uintptr_t fbo = hw_render.get_current_framebuffer();
 
-        unsigned width = 640;
-        unsigned height = 480;
+        unsigned width = 640 * opt_surface_scale;
+        unsigned height = 480 * opt_surface_scale;
 
         if (tex) {
+            GLint texture_width = 0, texture_height = 0, previous_texture = 0;
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &texture_width);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &texture_height);
+            glBindTexture(GL_TEXTURE_2D, previous_texture);
+            if (texture_width > 0 && texture_height > 0) {
+                width = (unsigned)texture_width;
+                height = (unsigned)texture_height;
+            }
+            static unsigned output_width = 0, output_height = 0;
+            if (width != output_width || height != output_height) {
+                struct retro_game_geometry geometry = { width, height, 6400, 5760, 4.0f / 3.0f };
+                environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
+                output_width = width;
+                output_height = height;
+            }
             blit_nv2a_texture(tex, width, height, fbo);
         } else {
             /* No framebuffer yet */

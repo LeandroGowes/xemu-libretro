@@ -38,6 +38,21 @@ struct retro_core_option_v2_category option_cats_us[] = {
 };
 
 struct retro_core_option_v2_definition option_defs_us[] = {
+    {
+        "xemu_renderer",
+        "Graphics Renderer (Restart Required)",
+        NULL,
+        "Choose the graphics API. Auto follows the frontend preference. Restart the game after changing this option.",
+        NULL,
+        "video",
+        {
+            { "auto", "Auto" },
+            { "opengl", "OpenGL" },
+            { "vulkan", "Vulkan" },
+            { NULL, NULL },
+        },
+        "auto"
+    },
     /* NOTE: File path options (bootrom, bios, hdd, eeprom) are not exposed
      * as core options because they require text input which core options
      * don't support (dropdown only). Paths are auto-detected from
