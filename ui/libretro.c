@@ -283,8 +283,9 @@ static void blit_nv2a_texture(GLuint tex, unsigned width, unsigned height, uintp
     glUseProgram(blit_program);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    GLint filtering = opt_filtering == CONFIG_DISPLAY_FILTERING_NEAREST ? GL_NEAREST : GL_LINEAR;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filtering);
     glUniform1i(blit_tex_loc, 0);
 
     glBindVertexArray(blit_vao);
@@ -745,7 +746,13 @@ static void update_variables(void)
     /* Apply runtime-safe options */
     if (emu_initialized) {
         g_config.audio.volume_limit = opt_audio_volume / 100.0f;
-        g_config.display.quality.surface_scale = opt_surface_scale;
+        if (g_config.display.quality.surface_scale != opt_surface_scale) {
+            /* The renderer must flush/recreate scaled surfaces, as in xemu's UI.
+             * Its setter releases/reacquires BQL, so acquire it on this thread. */
+            bql_lock();
+            nv2a_set_surface_scale_factor(opt_surface_scale);
+            bql_unlock();
+        }
         g_config.display.filtering = opt_filtering;
         g_config.perf.cache_shaders = opt_cache_shaders;
         g_config.audio.use_dsp = opt_use_dsp;
