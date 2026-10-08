@@ -43,6 +43,13 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
     PGRAPHState *pg = &d->pgraph;
+    const hwaddr guest_addr = addr;
+    const unsigned int byte_offset = addr & 3;
+    /* QEMU splits unaligned/cross-register accesses, but byte and halfword
+     * reads can still start within a 32-bit register (Mercenaries does this).
+     * Internal register helpers require an aligned address. */
+    assert(size >= 1 && size <= 4 && byte_offset + size <= 4);
+    addr &= ~(hwaddr)3;
 
     qemu_mutex_lock(&pg->lock);
 
@@ -76,7 +83,8 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
 
     qemu_mutex_unlock(&pg->lock);
 
-    nv2a_reg_log_read(NV_PGRAPH, addr, size, r);
+    r = (r >> (byte_offset * 8)) & (UINT32_MAX >> ((4 - size) * 8));
+    nv2a_reg_log_read(NV_PGRAPH, guest_addr, size, r);
     return r;
 }
 

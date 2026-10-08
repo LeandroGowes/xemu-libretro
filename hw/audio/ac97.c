@@ -660,6 +660,33 @@ static uint32_t nabm_readb(void *opaque, uint32_t addr)
     uint32_t val = ~0U;
 
     switch (addr) {
+    case PI_BDBAR ... PI_BDBAR + 3:
+    case PO_BDBAR ... PO_BDBAR + 3:
+    case MC_BDBAR ... MC_BDBAR + 3:
+    case SO_BDBAR ... SO_BDBAR + 3:
+        r = &s->bm_regs[GET_BM(addr)];
+        val = (r->bdbar >> ((addr & 3) * 8)) & 0xff;
+        break;
+    case PI_SR + 1:
+    case PO_SR + 1:
+    case MC_SR + 1:
+    case SO_SR + 1:
+        r = &s->bm_regs[GET_BM(addr)];
+        val = (r->sr >> 8) & 0xff;
+        break;
+    case PI_PICB ... PI_PICB + 1:
+    case PO_PICB ... PO_PICB + 1:
+    case MC_PICB ... MC_PICB + 1:
+    case SO_PICB ... SO_PICB + 1:
+        r = &s->bm_regs[GET_BM(addr)];
+        val = (r->picb >> ((addr & 1) * 8)) & 0xff;
+        break;
+    case GLOB_CNT ... GLOB_CNT + 3:
+        val = (s->glob_cnt >> ((addr & 3) * 8)) & 0xff;
+        break;
+    case GLOB_STA ... GLOB_STA + 3:
+        val = ((s->glob_sta | GS_S0CR) >> ((addr & 3) * 8)) & 0xff;
+        break;
     case CAS:
         dolog("CAS %d", s->cas);
         val = s->cas;
@@ -707,7 +734,8 @@ static uint32_t nabm_readb(void *opaque, uint32_t addr)
         break;
     default:
         dolog("U nabm readb 0x%x -> 0x%x", addr, val);
-        assert(0);
+        /* Reserved/unimplemented reads return all ones, as in upstream QEMU.
+         * A guest probing the register space must not abort the emulator. */
         break;
     }
     return val;

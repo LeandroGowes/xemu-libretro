@@ -260,8 +260,9 @@ static uint64_t gp_read(void *opaque, hwaddr addr, unsigned int size)
 {
     MCPXAPUState *d = opaque;
 
-    assert(size == 4);
-    assert(addr % 4 == 0);
+    const unsigned int byte_offset = addr & 3;
+    assert(size >= 1 && size <= 4 && byte_offset + size <= 4);
+    addr &= ~(hwaddr)3;
 
     uint64_t r = 0;
     switch (addr) {
@@ -295,7 +296,7 @@ static uint64_t gp_read(void *opaque, hwaddr addr, unsigned int size)
     }
     DPRINTF("mcpx apu GP: read [0x%" HWADDR_PRIx "] -> 0x%lx\n", addr, r);
 
-    return r;
+    return (r >> (byte_offset * 8)) & (UINT32_MAX >> ((4 - size) * 8));
 }
 
 static void gp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
@@ -356,8 +357,9 @@ static uint64_t ep_read(void *opaque, hwaddr addr, unsigned int size)
 {
     MCPXAPUState *d = opaque;
 
-    assert(size == 4);
-    assert(addr % 4 == 0);
+    const unsigned int byte_offset = addr & 3;
+    assert(size >= 1 && size <= 4 && byte_offset + size <= 4);
+    addr &= ~(hwaddr)3;
 
     uint64_t r = 0;
     switch (addr) {
@@ -385,7 +387,7 @@ static uint64_t ep_read(void *opaque, hwaddr addr, unsigned int size)
     }
     DPRINTF("mcpx apu EP: read [0x%" HWADDR_PRIx "] -> 0x%lx\n", addr, r);
 
-    return r;
+    return (r >> (byte_offset * 8)) & (UINT32_MAX >> ((4 - size) * 8));
 }
 
 static void ep_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
