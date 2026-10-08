@@ -15,6 +15,7 @@
 #include "system/system.h"
 #include "system/runstate.h"
 #include "system/cpus.h"
+#include "block/block-global-state.h"
 #include "migration/snapshot.h"
 #include "ui/console.h"
 #include "hw/xbox/nv2a/nv2a.h"
@@ -135,6 +136,7 @@ enum {
 static volatile int snapshot_request = SNAPSHOT_NONE;
 static volatile bool snapshot_done = false;
 static volatile bool snapshot_result = false;
+static char snapshot_name[64];
 static HANDLE snapshot_request_event = NULL;  /* signal emu thread */
 static HANDLE snapshot_done_event = NULL;     /* signal RA thread */
 
@@ -877,14 +879,14 @@ static void *emu_thread_func(void *opaque)
             Error *snap_err = NULL;
 
             if (req == SNAPSHOT_SAVE) {
-                ok = save_snapshot("libretro_save", true, NULL, false, NULL, &snap_err);
+                ok = save_snapshot(snapshot_name, true, NULL, false, NULL, &snap_err);
                 if (!ok && snap_err) {
                     error_free(snap_err);
                 }
             } else if (req == SNAPSHOT_LOAD) {
                 bool was_running = runstate_is_running();
                 vm_stop(RUN_STATE_RESTORE_VM);
-                ok = load_snapshot("libretro_save", NULL, false, NULL, &snap_err);
+                ok = load_snapshot(snapshot_name, NULL, false, NULL, &snap_err);
                 if (ok && was_running) {
                     vm_start();
                 } else if (!ok) {
@@ -901,6 +903,17 @@ static void *emu_thread_func(void *opaque)
         }
     }
 
+    /* The isolated frontend exits after retro_unload_game. Stop new guest
+     * writes and finish outstanding block I/O before that process exits;
+     * flushing Libretro save RAM alone does not flush the Xbox HDD. */
+    pause_all_vcpus();
+    bdrv_drain_all();
+    int flush_result = bdrv_flush_all();
+    if (flush_result < 0) {
+        LRLOG_ERROR("[xemu] HDD flush failed during shutdown: %d\n", flush_result);
+    } else {
+        LRLOG_INFO("[xemu] HDD I/O drained and flushed before shutdown\n");
+    }
     bql_unlock();
     return NULL;
 }
@@ -997,7 +1010,9 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
 {
     memset(info, 0, sizeof(*info));
     info->library_name     = "xemu";
-    info->library_version  = xemu_version;
+    static char state_version[128];
+    g_snprintf(state_version, sizeof(state_version), "%s-state-v2", xemu_version);
+    info->library_version  = state_version;
     info->valid_extensions = "iso|xiso";
     info->need_fullpath    = true;
     info->block_extract    = true;
@@ -1352,19 +1367,11 @@ RETRO_API void retro_run(void)
             goto vk_audio;
         }
 
-        static bool vk_display_initialized = false;
-
-        if (!vk_display_initialized) {
-            /* First frame: blocking sync to initialize display image */
-            int tex = nv2a_get_framebuffer_surface();
-            nv2a_release_framebuffer_surface();
-            if (tex) {
-                vk_display_initialized = true;
-            }
-        } else {
-            /* Subsequent frames: trigger async render (non-blocking) */
-            nv2a_trigger_display_render();
-        }
+        /* Wait for PFIFO to finish this display render before importing or
+         * reading it. Returning the previous image while an asynchronous
+         * update writes it reports full callback FPS without stable frames.
+         * Keep the framebuffer lease until the frontend has consumed it. */
+        nv2a_get_framebuffer_surface();
 
         /* Get VK display info */
         void *ext_handle = NULL;
@@ -1373,12 +1380,13 @@ RETRO_API void retro_run(void)
 
         if (ext_handle && disp_w > 0 && disp_h > 0) {
             /* Import xemu's display image into RA's VkDevice */
-            static bool vk_layout_set = false;
+            bool new_import = ra_vk_image == VK_NULL_HANDLE ||
+                ext_handle != ra_last_handle || (uint32_t)disp_w != ra_vk_width ||
+                (uint32_t)disp_h != ra_vk_height;
             if (ra_vk_import_display(ext_handle, disp_w, disp_h)) {
-                if (!vk_layout_set) {
+                if (new_import) {
                     ra_vk_transition_layout(ra_vk_image,
                         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-                    vk_layout_set = true;
                 }
                 ra_vk_transition_layout(ra_vk_image,
                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
@@ -1401,6 +1409,7 @@ RETRO_API void retro_run(void)
         } else {
             video_cb(NULL, width, height, 0);
         }
+        nv2a_release_framebuffer_surface();
     }
 
 vk_audio:
@@ -1416,13 +1425,15 @@ vk_audio:
             audio_flushed = true;
         }
 
-        /* Pull available frames, skip excess to stay near real-time */
+        /* Drain short scheduling backlogs rather than dropping the audio of
+         * a late video frame. Bound latency to 100 ms; only a sustained stall
+         * should discard audio, retaining a 50 ms reserve when it does. */
         extern int libretro_audio_ring_frames(void);
         int avail = libretro_audio_ring_frames();
 
-        if (avail > 1600) {
+        if (avail > 4800) {
             int16_t discard_buf[1602];
-            int skip = avail - 801; /* leave ~801 frames to pull */
+            int skip = avail - 2400;
             while (skip > 0) {
                 int chunk = skip > 801 ? 801 : skip;
                 libretro_audio_pull(discard_buf, chunk);
@@ -1431,8 +1442,8 @@ vk_audio:
             avail = libretro_audio_ring_frames();
         }
 
-        int16_t audio_buf[1602]; /* 801 stereo frames */
-        int frames = libretro_audio_pull(audio_buf, 801);
+        int16_t audio_buf[6408]; /* Up to four video frames of stereo audio. */
+        int frames = libretro_audio_pull(audio_buf, 3204);
 
         if (frames > 0) {
             audio_batch_cb(audio_buf, frames);
@@ -1463,6 +1474,8 @@ struct libretro_savestate_header {
     uint32_t magic;
     uint32_t version;
     uint64_t timestamp;
+    char content_sha256[65];
+    char snapshot[64];
 };
 
 static bool snapshot_dispatch(int request_type, int timeout_ms)
@@ -1476,6 +1489,7 @@ static bool snapshot_dispatch(int request_type, int timeout_ms)
 
     snapshot_done = false;
     snapshot_result = false;
+    ResetEvent(snapshot_done_event);
     snapshot_request = request_type;
 
     /* Wait for the emu thread to process it */
@@ -1502,6 +1516,12 @@ RETRO_API bool retro_serialize(void *data, size_t size)
 
     memset(data, 0, LIBRETRO_SAVESTATE_SIZE);
 
+    /* Each marker names an immutable snapshot, including undo states. Never
+     * replace the shared legacy libretro_save snapshot or another game's save. */
+    char *uuid = g_uuid_string_random();
+    g_snprintf(snapshot_name, sizeof(snapshot_name), "libretro_%s", uuid);
+    g_free(uuid);
+
     bool ok = snapshot_dispatch(SNAPSHOT_SAVE, 30000);
 
     if (!ok) {
@@ -1511,10 +1531,15 @@ RETRO_API bool retro_serialize(void *data, size_t size)
 
     struct libretro_savestate_header *hdr = (struct libretro_savestate_header *)data;
     hdr->magic = LIBRETRO_SAVESTATE_MAGIC;
-    hdr->version = 1;
+    hdr->version = 2;
     hdr->timestamp = (uint64_t)time(NULL);
+    const char *content = g_config.sys.files.dvd_path;
+    char *hash = g_compute_checksum_for_string(G_CHECKSUM_SHA256, content, -1);
+    g_strlcpy(hdr->content_sha256, hash, sizeof(hdr->content_sha256));
+    g_free(hash);
+    g_strlcpy(hdr->snapshot, snapshot_name, sizeof(hdr->snapshot));
 
-    LRLOG_INFO("[xemu] retro_serialize: snapshot saved to HDD image\n");
+    LRLOG_INFO("[xemu] retro_serialize: snapshot %s saved to HDD image\n", snapshot_name);
     return true;
 }
 
@@ -1530,6 +1555,25 @@ RETRO_API bool retro_unserialize(const void *data, size_t size)
         return false;
     }
 
+    /* v1 contains no game identity and references one mutable global snapshot.
+     * Its original game cannot be established safely, so preserve but reject. */
+    if (hdr->version != 2 || hdr->content_sha256[64] != '\0' ||
+        hdr->snapshot[63] != '\0' || strlen(hdr->snapshot) != 45 ||
+        strncmp(hdr->snapshot, "libretro_", 9) != 0 ||
+        !g_uuid_string_is_valid(hdr->snapshot + 9)) {
+        LRLOG_WARN("[xemu] State rejected: legacy or invalid snapshot marker\n");
+        return false;
+    }
+    char *hash = g_compute_checksum_for_string(G_CHECKSUM_SHA256,
+                                             g_config.sys.files.dvd_path, -1);
+    bool matches = strcmp(hash, hdr->content_sha256) == 0;
+    g_free(hash);
+    if (!matches) {
+        LRLOG_WARN("[xemu] State rejected: belongs to a different game\n");
+        return false;
+    }
+    g_strlcpy(snapshot_name, hdr->snapshot, sizeof(snapshot_name));
+
     bool ok = snapshot_dispatch(SNAPSHOT_LOAD, 30000);
 
     if (!ok) {
@@ -1537,7 +1581,11 @@ RETRO_API bool retro_unserialize(const void *data, size_t size)
         return false;
     }
 
-    LRLOG_INFO("[xemu] retro_unserialize: snapshot loaded from HDD image\n");
+    LRLOG_INFO("[xemu] retro_unserialize: snapshot %s loaded from HDD image\n", snapshot_name);
+    /* Host audio buffers and this APU ring must both start on the restored
+     * timeline. Pending samples are not part of the QEMU snapshot. */
+    extern void libretro_audio_flush(void);
+    libretro_audio_flush();
     return true;
 }
 
