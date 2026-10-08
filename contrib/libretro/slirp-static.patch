@@ -1,0 +1,13 @@
+diff --git a/src/libslirp.h b/src/libslirp.h
+--- a/src/libslirp.h
++++ b/src/libslirp.h
+@@ -12,6 +12,8 @@
+ #include <basetsd.h>
+ typedef SSIZE_T slirp_ssize_t;
+-#ifdef BUILDING_LIBSLIRP
++#if defined(LIBSLIRP_STATIC)
++# define SLIRP_EXPORT
++#elif defined(BUILDING_LIBSLIRP)
+ # define SLIRP_EXPORT __declspec(dllexport)
+ #else
+ # define SLIRP_EXPORT __declspec(dllimport)
